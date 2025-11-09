@@ -1,0 +1,7 @@
+requests
+beautifulsoup4
+psycopg2-binary
+python-dotenv
+fastapi
+uvicorn[standard]
+python-multipart
