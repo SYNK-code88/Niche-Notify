@@ -12,24 +12,20 @@ load_dotenv()
 
 app = FastAPI(title="Niche-Notify API", version="1.0")
 
-# --- FIX 2: Add CORS Middleware ---
-# This allows your Netlify frontend to make requests to this API.
+# --- This is the CORS middleware ---
 origins = [
-    "*",  # Allows all origins. For production, you might restrict this
-          # to "https://your-netlify-site.netlify.app"
+    "*",  # Allows all origins
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, DELETE)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# --- FIX 1: Update Pydantic Model ---
-# This model defines the data your API expects from the frontend.
-# It now matches your database schema.
+# --- This is the Pydantic Model ---
 class MonitorIn(BaseModel):
     url: str
     css_selector: str
@@ -49,17 +45,15 @@ def get_monitors():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/monitors")
-def add_monitor(monitor: MonitorIn):  # Use the fixed MonitorIn model
+def add_monitor(monitor: MonitorIn):
     """Add a new monitor to the database"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # --- FIX 1: Update INSERT statement ---
-        # Match the columns in your db.py 'create_schema' function
         cur.execute(
             "INSERT INTO monitors (url, css_selector, user_email, last_content) VALUES (%s, %s, %s, %s) RETURNING id;",
-            (monitor.url, monitor.css_selector, monitor.user_email, None) # Get data from the 'monitor' object
+            (monitor.url, monitor.css_selector, monitor.user_email, None)
         )
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -69,10 +63,9 @@ def add_monitor(monitor: MonitorIn):  # Use the fixed MonitorIn model
     except psycopg2.Error as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=5Get-Monitor{e})
+        # --- THIS WAS THE FIRST BROKEN LINE ---
+        raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW: Add DELETE Endpoint (for Phase 2/4) ---
-# This is the endpoint your "Delete" button will call.
 @app.delete("/monitors/{monitor_id}")
 def delete_monitor(monitor_id: int):
     """Delete a monitor from the database by its ID"""
@@ -80,7 +73,6 @@ def delete_monitor(monitor_id: int):
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Execute the delete command
         cur.execute("DELETE FROM monitors WHERE id = %s RETURNING id;", (monitor_id,))
         
         deleted_id = cur.fetchone()
@@ -97,4 +89,5 @@ def delete_monitor(monitor_id: int):
     except psycopg2.Error as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
+        # --- THIS WAS THE SECOND BROKEN LINE (from your log) ---
         raise HTTPException(status_code=500, detail=str(e))
