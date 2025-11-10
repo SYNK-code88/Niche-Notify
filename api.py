@@ -1,5 +1,5 @@
 # api.py
-# Combines all logic from api.py, db.py, utils.py, and worker.py
+# Combines all logic + per-user isolation using secret_key
 
 import os
 import time
@@ -9,23 +9,19 @@ import psycopg2
 import requests
 from psycopg2.extras import RealDictCursor
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 # --- Load .env file ---
-# This loads DATABASE_URL and the new WORKER_SECRET
 load_dotenv()
 
-# ==============================================================================
-# --- DB.PY FUNCTIONS ---
-# ==============================================================================
+# ======================================================================
+# --- DB FUNCTIONS ---
+# ======================================================================
 
 def get_db_connection():
-    """
-    Returns a new psycopg2 connection using DATABASE_URL env variable.
-    """
     DATABASE_URL = os.getenv("DATABASE_URL")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not set in environment")
@@ -34,7 +30,7 @@ def get_db_connection():
 def create_schema():
     """
     Creates the monitors table if it doesn't exist.
-    Run this once on startup.
+    Added a new column: user_key (text)
     """
     create_sql = """
     CREATE TABLE IF NOT EXISTS monitors (
@@ -42,6 +38,7 @@ def create_schema():
         url TEXT NOT NULL,
         css_selector TEXT NOT NULL,
         user_email TEXT NOT NULL,
+        user_key TEXT NOT NULL,
         last_content TEXT,
         last_checked_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
@@ -58,11 +55,18 @@ def create_schema():
         print(f"Error creating schema: {e}")
         traceback.print_exc()
 
+def get_monitors_by_user(user_key):
+    """Fetch monitors for a specific user_key"""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM monitors WHERE user_key = %s ORDER BY id DESC", (user_key,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
 def get_all_monitors():
-    """
-    Returns a list of monitors as dicts:
-    [{id, url, css_selector, user_email, last_content, last_checked_at}, ...]
-    """
+    """(Used by worker) Fetch all monitors"""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM monitors")
@@ -72,9 +76,6 @@ def get_all_monitors():
     return rows
 
 def update_monitor_content(monitor_id, new_content):
-    """
-    Update last_content and last_checked_at for a monitor.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(
@@ -85,26 +86,17 @@ def update_monitor_content(monitor_id, new_content):
     cur.close()
     conn.close()
 
-# ==============================================================================
-# --- UTILS.PY FUNCTIONS ---
-# ==============================================================================
+# ======================================================================
+# --- UTILS ---
+# ======================================================================
 
 def fetch_html(url, timeout=10):
-    """
-    Returns the response text for a given URL or raises requests exceptions.
-    """
-    headers = {
-        "User-Agent": "Niche-Notify/1.0 (+https://example.com)"
-    }
+    headers = {"User-Agent": "Niche-Notify/1.0 (+https://example.com)"}
     resp = requests.get(url, headers=headers, timeout=timeout)
     resp.raise_for_status()
     return resp.text
 
 def extract_with_selector(html, selector):
-    """
-    Parse HTML and return the text inside the first matched CSS selector.
-    If selector not found, returns an empty string.
-    """
     soup = BeautifulSoup(html, "html.parser")
     el = soup.select_one(selector)
     if not el:
@@ -112,17 +104,11 @@ def extract_with_selector(html, selector):
     return el.get_text(strip=True)
 
 def compute_hash(text):
-    """
-    Return a short hash for the text (useful to compare changes).
-    """
     if text is None:
         text = ""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 def notify_placeholder(email, url, old, new):
-    """
-    Phase-1 notifier: just prints to console.
-    """
     print("=== ALERT ===")
     print(f"To: {email}")
     print(f"URL: {url}")
@@ -130,14 +116,11 @@ def notify_placeholder(email, url, old, new):
     print("New snippet:", (new or "<empty>")[:200])
     print("=============")
 
-# ==============================================================================
-# --- WORKER.PY FUNCTIONS ---
-# ==============================================================================
+# ======================================================================
+# --- WORKER ---
+# ======================================================================
 
 def process_once():
-    """
-    This is the main worker logic, moved into a function.
-    """
     monitors = get_all_monitors()
     if not monitors:
         print("Worker: No monitors found in DB.")
@@ -162,7 +145,6 @@ def process_once():
             
             # Compare
             if last_content.strip() == "":
-                # First run
                 print(f"Worker: Monitor {mid}: first snapshot recorded.")
                 update_monitor_content(mid, new_text)
             else:
@@ -178,62 +160,54 @@ def process_once():
     
     print("Worker: Process complete.")
 
-# ==============================================================================
-# --- API.PY LOGIC (FastAPI App) ---
-# ==============================================================================
+# ======================================================================
+# --- FASTAPI APP ---
+# ======================================================================
 
-app = FastAPI(title="Niche-Notify API", version="1.0")
+app = FastAPI(title="Niche-Notify API", version="1.1")
 
-# --- CORS middleware ---
-origins = ["*"]  # Allows all origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Pydantic Model ---
 class MonitorIn(BaseModel):
     url: str
     css_selector: str
     user_email: str
+    user_key: str  # NEW FIELD
 
-# --- Startup Event ---
 @app.on_event("startup")
 def on_startup():
-    """
-    Run create_schema() when the API server starts.
-    """
     print("Application starting up...")
     create_schema()
-
-# --- API Endpoints ---
 
 @app.get("/")
 def root():
     return {"message": "Welcome to Niche-Notify API"}
 
 @app.get("/monitors")
-def get_monitors_endpoint():
-    """Fetch all monitors from the database"""
+def get_monitors_endpoint(user_key: str = Query(...)):
+    """Fetch monitors belonging to a specific user_key"""
     try:
-        monitors = get_all_monitors()
+        monitors = get_monitors_by_user(user_key)
         return {"count": len(monitors), "data": monitors}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/monitors")
 def add_monitor_endpoint(monitor: MonitorIn):
-    """Add a new monitor to the database"""
+    """Add a new monitor"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
         cur.execute(
-            "INSERT INTO monitors (url, css_selector, user_email, last_content) VALUES (%s, %s, %s, %s) RETURNING id;",
-            (monitor.url, monitor.css_selector, monitor.user_email, None)
+            "INSERT INTO monitors (url, css_selector, user_email, user_key, last_content) VALUES (%s, %s, %s, %s, %s) RETURNING id;",
+            (monitor.url, monitor.css_selector, monitor.user_email, monitor.user_key, None)
         )
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -246,14 +220,13 @@ def add_monitor_endpoint(monitor: MonitorIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/monitors/{monitor_id}")
-def delete_monitor_endpoint(monitor_id: int):
-    """Delete a monitor from the database by its ID"""
+def delete_monitor_endpoint(monitor_id: int, user_key: str = Query(...)):
+    """Delete a monitor by ID only if it belongs to this user_key"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        cur.execute("DELETE FROM monitors WHERE id = %s RETURNING id;", (monitor_id,))
-        
+        cur.execute("DELETE FROM monitors WHERE id = %s AND user_key = %s RETURNING id;", (monitor_id, user_key))
         deleted_id = cur.fetchone()
         conn.commit()
         
@@ -263,35 +236,21 @@ def delete_monitor_endpoint(monitor_id: int):
         if deleted_id:
             return {"message": "Monitor deleted successfully", "id": deleted_id[0]}
         else:
-            raise HTTPException(status_code=404, detail="Monitor not found")
-            
+            raise HTTPException(status_code=404, detail="Monitor not found or unauthorized")
     except psycopg2.Error as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW WORKER ENDPOINT ---
-
 @app.post("/worker/run")
 def run_worker_endpoint(secret: str):
-    """
-    Triggers the worker process (process_once) if the secret is valid.
-    """
     WORKER_SECRET = os.getenv("WORKER_SECRET")
-    
     if not WORKER_SECRET:
-        print("WORKER_SECRET is not set in environment. Cannot run worker.")
-        raise HTTPException(status_code=500, detail="Worker is not configured")
-
+        raise HTTPException(status_code=500, detail="Worker secret not set")
     if secret != WORKER_SECRET:
-        print("Invalid secret provided for worker endpoint.")
         raise HTTPException(status_code=403, detail="Invalid secret")
-
     try:
-        print("API: Worker process triggered via POST /worker/run")
         process_once()
-        return {"message": "Worker process completed successfully."}
+        return {"message": "Worker completed successfully"}
     except Exception as e:
-        print(f"API: Error during triggered worker run: {e}")
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Worker error: {str(e)}")
