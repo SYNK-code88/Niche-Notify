@@ -1,5 +1,5 @@
 # api.py
-# Combines all logic + per-user isolation using secret_key
+# Combines API + Worker + Multi-user (user_key) + APScheduler auto-run
 
 import os
 import time
@@ -9,17 +9,18 @@ import psycopg2
 import requests
 from psycopg2.extras import RealDictCursor
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # --- Load .env file ---
 load_dotenv()
 
-# ======================================================================
-# --- DB FUNCTIONS ---
-# ======================================================================
+# ==============================================================================
+# --- DATABASE FUNCTIONS ---
+# ==============================================================================
 
 def get_db_connection():
     DATABASE_URL = os.getenv("DATABASE_URL")
@@ -30,7 +31,7 @@ def get_db_connection():
 def create_schema():
     """
     Creates the monitors table if it doesn't exist.
-    Added a new column: user_key (text)
+    Also adds user_key column if missing (for multi-user support).
     """
     create_sql = """
     CREATE TABLE IF NOT EXISTS monitors (
@@ -38,25 +39,28 @@ def create_schema():
         url TEXT NOT NULL,
         css_selector TEXT NOT NULL,
         user_email TEXT NOT NULL,
-        user_key TEXT NOT NULL,
         last_content TEXT,
         last_checked_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
     """
+    alter_sql = """
+    ALTER TABLE monitors ADD COLUMN IF NOT EXISTS user_key TEXT;
+    """
+
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(create_sql)
+        cur.execute(alter_sql)
         conn.commit()
         cur.close()
         conn.close()
-        print("Database schema check complete. Table 'monitors' is ready.")
+        print("✅ Database schema check complete. Table 'monitors' is ready and up to date.")
     except Exception as e:
-        print(f"Error creating schema: {e}")
+        print(f"❌ Error creating/updating schema: {e}")
         traceback.print_exc()
 
 def get_monitors_by_user(user_key):
-    """Fetch monitors for a specific user_key"""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM monitors WHERE user_key = %s ORDER BY id DESC", (user_key,))
@@ -66,7 +70,6 @@ def get_monitors_by_user(user_key):
     return rows
 
 def get_all_monitors():
-    """(Used by worker) Fetch all monitors"""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT * FROM monitors")
@@ -86,9 +89,9 @@ def update_monitor_content(monitor_id, new_content):
     cur.close()
     conn.close()
 
-# ======================================================================
+# ==============================================================================
 # --- UTILS ---
-# ======================================================================
+# ==============================================================================
 
 def fetch_html(url, timeout=10):
     headers = {"User-Agent": "Niche-Notify/1.0 (+https://example.com)"}
@@ -112,13 +115,13 @@ def notify_placeholder(email, url, old, new):
     print("=== ALERT ===")
     print(f"To: {email}")
     print(f"URL: {url}")
-    print("Old snippet:", (old or "<empty>")[:200])
-    print("New snippet:", (new or "<empty>")[:200])
+    print("Old snippet:", (old or '<empty>')[:200])
+    print("New snippet:", (new or '<empty>')[:200])
     print("=============")
 
-# ======================================================================
-# --- WORKER ---
-# ======================================================================
+# ==============================================================================
+# --- WORKER LOGIC ---
+# ==============================================================================
 
 def process_once():
     monitors = get_all_monitors()
@@ -127,7 +130,7 @@ def process_once():
         return
 
     print(f"Worker: Processing {len(monitors)} monitor(s)...")
-    
+
     for m in monitors:
         mid = m["id"]
         url = m["url"]
@@ -142,8 +145,7 @@ def process_once():
             new_text = extract_with_selector(html, selector)
             if new_text is None:
                 new_text = ""
-            
-            # Compare
+
             if last_content.strip() == "":
                 print(f"Worker: Monitor {mid}: first snapshot recorded.")
                 update_monitor_content(mid, new_text)
@@ -155,16 +157,16 @@ def process_once():
                 else:
                     print(f"Worker: No change for monitor id={mid}.")
         except Exception as exc:
-            print(f"Worker: Error checking monitor id={mid} url={url}: {exc}")
+            print(f"Worker: Error checking monitor id={mid}: {exc}")
             traceback.print_exc()
-    
+
     print("Worker: Process complete.")
 
-# ======================================================================
+# ==============================================================================
 # --- FASTAPI APP ---
-# ======================================================================
+# ==============================================================================
 
-app = FastAPI(title="Niche-Notify API", version="1.1")
+app = FastAPI(title="Niche-Notify API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -182,16 +184,21 @@ class MonitorIn(BaseModel):
 
 @app.on_event("startup")
 def on_startup():
-    print("Application starting up...")
+    print("🚀 Application starting up...")
     create_schema()
+
+    # Start background scheduler (every 15 minutes)
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(process_once, "interval", minutes=15, id="monitor_worker", replace_existing=True)
+    scheduler.start()
+    print("🕒 Background worker scheduled every 15 minutes.")
 
 @app.get("/")
 def root():
-    return {"message": "Welcome to Niche-Notify API"}
+    return {"message": "Welcome to Niche-Notify API (Multi-user + Scheduler)"}
 
 @app.get("/monitors")
 def get_monitors_endpoint(user_key: str = Query(...)):
-    """Fetch monitors belonging to a specific user_key"""
     try:
         monitors = get_monitors_by_user(user_key)
         return {"count": len(monitors), "data": monitors}
@@ -200,13 +207,15 @@ def get_monitors_endpoint(user_key: str = Query(...)):
 
 @app.post("/monitors")
 def add_monitor_endpoint(monitor: MonitorIn):
-    """Add a new monitor"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
         cur.execute(
-            "INSERT INTO monitors (url, css_selector, user_email, user_key, last_content) VALUES (%s, %s, %s, %s, %s) RETURNING id;",
+            """
+            INSERT INTO monitors (url, css_selector, user_email, user_key, last_content)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id;
+            """,
             (monitor.url, monitor.css_selector, monitor.user_email, monitor.user_key, None)
         )
         new_id = cur.fetchone()[0]
@@ -221,18 +230,14 @@ def add_monitor_endpoint(monitor: MonitorIn):
 
 @app.delete("/monitors/{monitor_id}")
 def delete_monitor_endpoint(monitor_id: int, user_key: str = Query(...)):
-    """Delete a monitor by ID only if it belongs to this user_key"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
         cur.execute("DELETE FROM monitors WHERE id = %s AND user_key = %s RETURNING id;", (monitor_id, user_key))
         deleted_id = cur.fetchone()
         conn.commit()
-        
         cur.close()
         conn.close()
-        
         if deleted_id:
             return {"message": "Monitor deleted successfully", "id": deleted_id[0]}
         else:
